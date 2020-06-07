@@ -1,43 +1,68 @@
 const functions = require('firebase-functions');
 const https = require('https');
+const url = require('url');
 
-const googleHostname = 'www.google.co.uk';
+const development = process.env.FUNCTIONS_EMULATOR === 'true';
 
-exports.index = functions.runWith({timeoutSeconds: 60}).https.onRequest(async (clientRequest, proxyResponse) => {
+const protocol = development ? 'http:' : 'https:';
+const host = development ? 'localhost:50000' : 'doogle.keve.ren';
+
+exports.index = functions.https.onRequest(async (clientRequest, proxyResponse) => {
 	try {
+		const clientRequestProtocol = clientRequest.headers['x-forwarded-proto'] ? clientRequest.headers['x-forwarded-proto'] + ':' : protocol;
+		const clientRequestHost = clientRequest.headers['x-forwarded-host'] || host;
+		const clientRequestPath = clientRequest.headers['x-forwarded-url'] || clientRequest.url;
+		const clientRequestHref = clientRequestProtocol + '//' + clientRequestHost + clientRequestPath;
+		const proxyRequestHost = clientRequestHost.replace(host, 'google.com');
+		const proxyRequestHref = 'https://' + proxyRequestHost + clientRequestPath;
+		console.log('URL translation:', clientRequestHref, ' -> ', proxyRequestHref);
 		// make request to server
-		const {serverResponse, serverResponseBody} = await new Promise((resolve, reject) => {
-			const options = {
-				hostname: googleHostname,
-				headers: Object.assign(clientRequest.headers, {
-					host: googleHostname
-				}),
+		await new Promise((resolve, reject) => {
+			const proxyRequestOptions = {
+				headers: {},
 				method: clientRequest.method,
-				path: clientRequest.url,
-				setHost: false,
-				rejectUnauthorized: false
 			};
-			// strip firebase headers
-			delete options.headers['x-forwarded-host'];
-			delete options.headers['x-original-url'];
+			for (const [key, value] of Object.entries(clientRequest.headers)) {
+				// only forward non-x headers as these are usually firebase headers
+				if (!/^x-/i.test(key)) {
+					proxyRequestOptions.headers[key] = value;
+				}
+			}
+			proxyRequestOptions.headers.host = proxyRequestHost;
 			// make request to server
-			const proxyRequest = https.request(options);
+			const proxyRequest = https.request(proxyRequestHref, proxyRequestOptions);
 			proxyRequest.on('error', reject);
 			proxyRequest.on('response', async serverResponse => {
 				try {
 					// sync headers and statusCode
-					for (const header of Object.entries(serverResponse.headers)) {
-						proxyResponse.setHeader(...header);
+					for (let [key, value] of Object.entries(serverResponse.headers)) {
+						if (key === 'location') {
+							console.log('redirect:', value);
+							value = value.replace(/google\.[^/?#]{0,7}/i, host);
+							value = value.replace(/^https:/, protocol);
+							console.log('redirect new value:', value);
+						}
+						proxyResponse.setHeader(key, value);
 					}
 					proxyResponse.statusCode = serverResponse.statusCode;
-					// stream response to client
-					serverResponse.on('readable', () => {
-						let chunk;
-						while(chunk = serverResponse.read()) {
-							proxyResponse.write(chunk);
-						}
-					});
-					serverResponse.on('end', resolve);
+					const responseContentType = serverResponse.headers['content-type'];
+					if (['html'].some(type => responseContentType.includes(type))) {
+						const chunks = [];
+						serverResponse.on('readable', () => {
+							let chunk;
+							while(chunk = serverResponse.read()) {
+								chunks.push(chunk);
+							}
+						});
+						serverResponse.on('end', () => {
+							let body = Buffer.concat(chunks);
+							proxyResponse.write(body);
+							resolve();
+						});
+					} else {
+						serverResponse.pipe(proxyResponse);
+						serverResponse.on('end', resolve);
+					}
 				} catch (error) {
 					reject(error);
 				}
