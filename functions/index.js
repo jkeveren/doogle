@@ -1,14 +1,12 @@
-import http from 'http';
-import https from 'https';
-
-const server = http.createServer();
+const functions = require('firebase-functions');
+const https = require('https');
 
 const googleHostname = 'www.google.co.uk';
 
-server.on('request', async (clientRequest, proxyResponse) => {
+exports.index = functions.runWith({timeoutSeconds: 60}).https.onRequest(async (clientRequest, proxyResponse) => {
 	try {
 		// make request to server
-		await new Promise((resolve, reject) => {
+		const {serverResponse, serverResponseBody} = await new Promise((resolve, reject) => {
 			const options = {
 				hostname: googleHostname,
 				headers: Object.assign(clientRequest.headers, {
@@ -17,8 +15,11 @@ server.on('request', async (clientRequest, proxyResponse) => {
 				method: clientRequest.method,
 				path: clientRequest.url,
 				setHost: false,
-				// rejectUnauthorized: false
+				rejectUnauthorized: false
 			};
+			// strip firebase headers
+			delete options.headers['x-forwarded-host'];
+			delete options.headers['x-original-url'];
 			// make request to server
 			const proxyRequest = https.request(options);
 			proxyRequest.on('error', reject);
@@ -49,9 +50,6 @@ server.on('request', async (clientRequest, proxyResponse) => {
 		proxyResponse.write(error.stack);
 		console.error(error);
 	} finally {
-		proxyResponse.end();
+		proxyResponse.send();
 	}
 });
-
-const port = process.env.PORT || 50000;
-server.listen(port, () => console.log('HTTP on port ' + port));
