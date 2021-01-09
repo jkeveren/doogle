@@ -163,8 +163,11 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) error {
 		}
 	}
 
-	// Modify origin and referer headers.
-	// Host header is set automatically by the proxyClient using the URL.
+	/*
+		Modify origin and referer headers.
+		Innacurate for cross origin requests but there shouldn't be any where this matters
+		Host header is set automatically by the proxyClient using the URL.
+	*/
 	if origin := origReq.Header.Get("origin"); origin != "" {
 		newOrigin, err := replaceURLSubdomain(proxyReqURL, origin)
 		if err != nil {
