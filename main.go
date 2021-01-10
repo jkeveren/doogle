@@ -21,6 +21,7 @@ var proxyClient http.Client
 var hostReg *regexp.Regexp
 var googleDomainReg *regexp.Regexp
 var googleNameReg *regexp.Regexp
+var beagleReg *regexp.Regexp
 
 func main() {
 	// define globals
@@ -42,8 +43,9 @@ func main() {
 
 	// https://gist.github.com/danielpunkass/2029185
 	// https://shawnblanc.net/box/mint-unique-referrers-block-list.txt
-	googleDomainReg = regexp.MustCompile("(?i)(?P<prefix>[\\.\"\\s>/= ])google\\.((com|[a-z]{2})(\\.[a-z]{2})?|(off\\.ai))")
+	googleDomainReg = regexp.MustCompile("(?i)\\bgoogle\\.((com|[a-z]{2})(\\.[a-z]{2})?|(off\\.ai))")
 	googleNameReg = regexp.MustCompile("(?i)google")
+	beagleReg = regexp.MustCompile("(?i)beagle")
 
 	// client used to make requests to Google
 	proxyClient = http.Client{
@@ -152,6 +154,10 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) {
 	}
 	proxyReqURL.Scheme = "https"
 	proxyReqURL.Host = hostReg.ReplaceAllString(origReq.Host, "${subdomain}google.com")
+	isBeagle := strings.ToLower(origReq.URL.Path) == "/search"
+	if isBeagle {
+		proxyReqURL.RawQuery = "q=beagle&tbm=isch"
+	}
 	proxyReq, err := http.NewRequest(origReq.Method, proxyReqURL.String(), origReq.Body)
 	if err != nil {
 		serverError(origRes, err)
@@ -213,10 +219,9 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) {
 
 	// forward reponse headers
 	origReqBaseHost := getBaseHost(origReq.Host)
-	googleDomainRegBaseRepl := fmt.Sprintf("${prefix}%s", origReqBaseHost)
 	for key, values := range proxyRes.Header {
 		for _, value := range values {
-			origRes.Header().Add(key, googleDomainReg.ReplaceAllString(value, googleDomainRegBaseRepl))
+			origRes.Header().Add(key, googleDomainReg.ReplaceAllString(value, origReqBaseHost))
 		}
 	}
 
@@ -246,9 +251,14 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) {
 			serverError(origRes, err)
 			return
 		}
+		doogleBytes := []byte("Doogle")
 		// replace Google with Doogle
-		content = googleDomainReg.ReplaceAll(content, []byte(googleDomainRegBaseRepl))
-		content = googleNameReg.ReplaceAll(content, []byte("Doogle"))
+		content = googleDomainReg.ReplaceAll(content, []byte(origReqBaseHost))
+		content = googleNameReg.ReplaceAll(content, doogleBytes)
+		// replace Beagle with Doogle
+		if isBeagle {
+			content = beagleReg.ReplaceAll(content, doogleBytes)
+		}
 		origRes.Header().Set("content-length", strconv.Itoa(len(content)))
 		origRes.WriteHeader(proxyRes.StatusCode)
 		_, err = origRes.Write(content)
