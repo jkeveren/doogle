@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,14 +15,18 @@ import (
 )
 
 var workingDirectory string
-var hostReg *regexp.Regexp
 var proxyClient http.Client
 
+// Regexp
+var hostReg *regexp.Regexp
+var googleDomainReg *regexp.Regexp
+var googleNameReg *regexp.Regexp
+
 func main() {
-	// Define Globals
+	// define globals
 	var err error
 
-	// Working Directory
+	// working directory
 	workingDirectory, err = os.Getwd()
 	if err != nil {
 		panic(err)
@@ -35,14 +40,19 @@ func main() {
 	*/
 	hostReg = regexp.MustCompile("^(?P<subdomain>.+?\\.)?(?P<name>(d|g)oogle.|localhost)(?P<extension>[a-z-\\.]+)?(?P<port>:\\d{1,5})?$")
 
-	// Client used to make requests to Google.
+	// https://gist.github.com/danielpunkass/2029185
+	// https://shawnblanc.net/box/mint-unique-referrers-block-list.txt
+	googleDomainReg = regexp.MustCompile("(?i)(?P<prefix>[\\.\"\\s>/= ])google\\.((com|[a-z]{2})(\\.[a-z]{2})?|(off\\.ai))")
+	googleNameReg = regexp.MustCompile("(?i)google")
+
+	// client used to make requests to Google
 	proxyClient = http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 
-	// Start Server
+	// start server
 	port, err := getPort()
 	if err != nil {
 		panic(err)
@@ -69,6 +79,7 @@ func getPort() (int, error) {
 type Handler struct{}
 
 func (h Handler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	fmt.Println(req.Host + req.URL.String())
 	overridePath, isSafe := sanitizePath(filepath.Join(workingDirectory, "overrides", req.URL.Path))
 	if !isSafe {
 		res.WriteHeader(403)
@@ -82,13 +93,12 @@ func (h Handler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	}
 
 	if overrideAvailable {
-		err = sendOverride(res, overridePath)
+		if err = sendOverride(res, overridePath); err != nil {
+			serverError(res, err)
+			return
+		}
 	} else {
-		err = proxyRequest(res, req)
-	}
-	if err != nil {
-		serverError(res, err)
-		return
+		proxyRequest(res, req)
 	}
 }
 
@@ -114,24 +124,14 @@ func isOverrideAvailable(path string) (bool, error) {
 }
 
 func sendOverride(res http.ResponseWriter, path string) error {
-	file, err := os.Open(path)
+	file, err := os.Open(strings.ToLower(path))
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-
-	buf := make([]byte, 1024)
-	for {
-		n, err := file.Read(buf)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-		_, err = res.Write(buf[:n])
-		if err != nil {
-			return err
-		}
+	_, err = io.Copy(res, file)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -143,17 +143,19 @@ func sendOverride(res http.ResponseWriter, path string) error {
 	Client<-[origRes]--Doogle<-[proxyRes]--Google
 */
 
-func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) error {
+func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) {
 	// forward requst method, URL and Body
 	proxyReqURL, err := url.Parse(origReq.URL.String())
 	if err != nil {
-		return err
+		serverError(origRes, err)
+		return
 	}
 	proxyReqURL.Scheme = "https"
 	proxyReqURL.Host = hostReg.ReplaceAllString(origReq.Host, "${subdomain}google.com")
 	proxyReq, err := http.NewRequest(origReq.Method, proxyReqURL.String(), origReq.Body)
 	if err != nil {
-		return err
+		serverError(origRes, err)
+		return
 	}
 
 	// forward request headers
@@ -162,23 +164,35 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) error {
 			proxyReq.Header.Add(key, value)
 		}
 	}
+	// noAcceptEncoding := origReq.Header.Get("accept-encoding") == ""
+	/*
+		Do not forward accept-encoding header.
+		The proxyClient Transport will transparently request compression and
+		decompress if Accept-Encoding header is not explicitly added and
+		DisableCompression is not enabled.
+		https://golang.org/pkg/net/http/#Transport
+	*/
+	proxyReq.Header.Del("accept-encoding")
 
 	/*
 		Modify origin and referer headers.
-		Innacurate for cross origin requests but there shouldn't be any where this matters
-		Host header is set automatically by the proxyClient using the URL.
+		Innacurate for cross origin requests but it seems that there are none where
+		it matters. Host header is set automatically by the proxyClient using the
+		URL.
 	*/
 	if origin := origReq.Header.Get("origin"); origin != "" {
 		newOrigin, err := replaceURLSubdomain(proxyReqURL, origin)
 		if err != nil {
-			return err
+			serverError(origRes, err)
+			return
 		}
 		proxyReq.Header.Set("origin", newOrigin)
 	}
 	if referer := origReq.Header.Get("referer"); referer != "" {
 		newReferer, err := replaceURLSubdomain(proxyReqURL, referer)
 		if err != nil {
-			return err
+			serverError(origRes, err)
+			return
 		}
 		proxyReq.Header.Set("referer", newReferer)
 	}
@@ -188,16 +202,21 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) error {
 	if err != nil {
 		if _, ok := err.(net.Error); ok && strings.HasSuffix(err.Error(), ": no such host") {
 			origRes.WriteHeader(404)
-			return nil
+			return
 		} else {
-			return err
+			serverError(origRes, err)
+			return
 		}
 	}
 
+	// fmt.Println(proxyRes.Header)
+
 	// forward reponse headers
+	origReqBaseHost := getBaseHost(origReq.Host)
+	googleDomainRegBaseRepl := fmt.Sprintf("${prefix}%s", origReqBaseHost)
 	for key, values := range proxyRes.Header {
 		for _, value := range values {
-			origRes.Header().Add(key, value)
+			origRes.Header().Add(key, googleDomainReg.ReplaceAllString(value, googleDomainRegBaseRepl))
 		}
 	}
 
@@ -205,38 +224,49 @@ func proxyRequest(origRes http.ResponseWriter, origReq *http.Request) error {
 	if location := proxyRes.Header.Get("location"); location != "" {
 		locationURL, err := url.Parse(location)
 		if err != nil {
-			return err
+			serverError(origRes, err)
+			return
 		}
 		locationURL.Scheme = "http" // TODO: check forwarded header
 
-		hostWithoutSub := hostReg.ReplaceAllString(origReq.Host, "${name}${extension}${port}")
-		regReplaceString := fmt.Sprintf("${subdomain}%s", hostWithoutSub)
-		locationURL.Host = hostReg.ReplaceAllString(locationURL.Host, regReplaceString)
+		repl := fmt.Sprintf("${subdomain}%s", origReqBaseHost)
+		locationURL.Host = hostReg.ReplaceAllString(locationURL.Host, repl)
 		origRes.Header().Set("Location", locationURL.String())
 	}
 
-	// forward status code
-	origRes.WriteHeader(proxyRes.StatusCode)
-
-	// forward response body
-	buf := make([]byte, 1024)
-	for {
-		n, err := proxyRes.Body.Read(buf)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-		_, err = origRes.Write(buf[:n])
+	/*
+		Forward response body.
+		For specific mime types, replace any instance of Google or its domains with
+		Doogle and its domains
+	*/
+	ct := strings.ToLower(proxyRes.Header.Get("content-type"))
+	if strings.HasPrefix(ct, "text/html") {
+		content, err := ioutil.ReadAll(proxyRes.Body)
 		if err != nil {
-			return err
+			serverError(origRes, err)
+			return
+		}
+		// replace Google with Doogle
+		content = googleDomainReg.ReplaceAll(content, []byte(googleDomainRegBaseRepl))
+		content = googleNameReg.ReplaceAll(content, []byte("Doogle"))
+		origRes.Header().Set("content-length", strconv.Itoa(len(content)))
+		origRes.WriteHeader(proxyRes.StatusCode)
+		_, err = origRes.Write(content)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	} else {
+		origRes.WriteHeader(proxyRes.StatusCode)
+		_, err := io.Copy(origRes, proxyRes.Body)
+		if err != nil {
+			fmt.Println(err)
+			return
 		}
 	}
-
-	return nil
 }
 
-// Replaces the subdomain of baseURL with the subdomain from subSrc
+// replaces the subdomain of baseURL with the subdomain from subSrc
 func replaceURLSubdomain(baseURL *url.URL, subSrc string) (string, error) {
 	subSrcURL, err := url.Parse(subSrc)
 	if err != nil {
@@ -245,8 +275,12 @@ func replaceURLSubdomain(baseURL *url.URL, subSrc string) (string, error) {
 	subSrcURL.Scheme = baseURL.Scheme
 
 	subdomain := hostReg.ReplaceAllString(subSrcURL.Host, "${subdomain}")
-	regReplaceString := fmt.Sprintf("%s${name}${extension}${port}", subdomain)
-	subSrcURL.Host = hostReg.ReplaceAllString(baseURL.Host, regReplaceString)
+	repl := fmt.Sprintf("%s${name}${extension}${port}", subdomain)
+	subSrcURL.Host = hostReg.ReplaceAllString(baseURL.Host, repl)
 
 	return subSrcURL.String(), nil
+}
+
+func getBaseHost(host string) string {
+	return hostReg.ReplaceAllString(host, "${name}${extension}${port}")
 }
