@@ -29,6 +29,8 @@ func main() {
 
 	// working directory
 	workingDirectory, err = os.Getwd()
+	// normalize for comparison in sanitizePath
+	workingDirectory = strings.ToLower(workingDirectory)
 	if err != nil {
 		panic(err)
 	}
@@ -94,6 +96,8 @@ func (h Handler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	fmt.Println(overrideAvailable)
+
 	if overrideAvailable {
 		if err = sendOverride(res, overridePath); err != nil {
 			serverError(res, err)
@@ -110,7 +114,8 @@ func serverError(res http.ResponseWriter, err error) {
 }
 
 func sanitizePath(path string) (cleanedPath string, isSafe bool) {
-	cleanedPath = filepath.Clean(path)
+	cleanedPath = strings.ToLower(filepath.Clean(path))
+	fmt.Println(cleanedPath, workingDirectory)
 	isSafe = strings.HasPrefix(cleanedPath, workingDirectory)
 	return
 }
@@ -126,7 +131,7 @@ func isOverrideAvailable(path string) (bool, error) {
 }
 
 func sendOverride(res http.ResponseWriter, path string) error {
-	file, err := os.Open(strings.ToLower(path))
+	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
